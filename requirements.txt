@@ -1,0 +1,27 @@
+# OpenEMMA-UI Requirements
+# Tested with Python 3.12, CUDA 12.8, RTX 5090
+
+# Core
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+pygame>=2.5.0
+Pillow>=10.0.0
+
+# VLM Backends
+transformers>=4.46.2
+accelerate>=0.25.0
+safetensors>=0.4.0
+
+# For LLaVA
+tokenizers>=0.15.0
+
+# For Qwen2-VL
+qwen-vl-utils>=0.0.2
+
+# For GPT-4o (optional)
+openai>=1.0.0
+
+# CARLA 0.9.16 PythonAPI (install separately)
+# pip install /path/to/CARLA_0.9.16/PythonAPI/carla/dist/carla-0.9.16-*.whl

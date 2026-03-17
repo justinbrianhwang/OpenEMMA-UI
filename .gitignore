@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Model weights (download separately)
+OpenEMMA/local/
+*.bin
+*.safetensors
+
+# CARLA temp files
+_temp_frame.jpg
+
+# Debug
+*.csv
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# API keys
+.env
