@@ -245,6 +245,58 @@ We benchmarked 4 VLM backends on Town01 with identical routes and traffic condit
 
 ---
 
+## Closed-Loop Driving Benchmark (LLaMA-3.2-11B)
+
+The original OpenEMMA paper evaluates **open-loop** on the nuScenes dataset (replayed frames,
+trajectory error vs. human ground truth — ADE/FDE). This repository adds a **closed-loop**
+benchmark: the VLM actually *drives* the car in CARLA, frame after frame, and we measure the
+resulting behaviour. There is no ground-truth trajectory (the car generates its own path), so we
+report driving-quality metrics instead.
+
+`benchmark.py` runs a fully automated, headless sweep (LLaMA-3.2-11B in 4-bit, **no GPT-4o**):
+the model is loaded once, every condition is run for 150 s of real-time-paced simulation, one CSV
+row is written per run, and the sweep is resumable. `run_sweep.py` supervises the CARLA server
+(auto-restart on crash) and `aggregate_results.py` produces the condition/town/weather rollups.
+
+**Sweep:** Town01 × {ClearNoon, WetCloudyNoon, ClearSunset, ClearNight, HardRainNoon,
+HardRainNight} × 2 seeds (deterministic routes), 12 runs total.
+
+| Condition | Completion % | VLM-steered % | Off-road % | Hallucination % | Avg speed (m/s) |
+|---|---|---|---|---|---|
+| ClearNoon | 61.6 ± 3.8 | 58.6 | 0.2 | 8.3 | 2.9 |
+| ClearSunset | 59.1 ± 2.8 | 61.3 | 0.1 | 33.3 | 2.8 |
+| ClearNight | 61.9 ± 3.5 | 66.2 | 0.1 | 10.0 | 2.9 |
+| HardRainNoon | 60.3 ± 4.1 | 70.0 | 3.9 | 50.0 | 2.9 |
+| HardRainNight | 61.6 ± 3.8 | 66.7 | 0.2 | 30.0 | 2.9 |
+| WetCloudyNoon | 30.8 ± 20.9 | 55.8 | 8.5 | 16.7 | 2.0 |
+| **Overall** | **55.9** | **63.1** | **2.2** | **24.7** | **2.7** |
+
+*Completion % = route waypoints reached / route length. VLM-steered % = frames where the
+integrated VLM curvature trajectory (not the route safety-net) drove steering. 9/12 runs
+completed cleanly (no collision / terminal off-road).*
+
+**Key findings:**
+- **The VLM provides the primary steering signal in the majority of frames** (58–70%), confirming
+  the model — not the route safety-net — is doing most of the driving.
+- **Time of day is not the limiting factor**: ClearNight (61.9%) matches daytime. The 11B model
+  drives at night about as well as at noon.
+- **Heavy rain is handled** after sanitising/flooring the VLM's speed and adding shallow-departure
+  off-road recovery: HardRain conditions reach ~60–62% (down from ~10% before those fixes).
+- **Hallucination rises in low-visibility conditions** (HardRainNoon 50%, ClearSunset 33%,
+  HardRainNight 30% vs. ClearNoon 8%) — the model more often reports "stop/red" on empty roads.
+- **WetCloudyNoon is the weak spot** (30.8%, high variance — one collision, one off-road exit),
+  the one condition where sanitisation was not enough.
+
+Raw rows and rollups: [`benchmark_results/`](benchmark_results/).
+
+> **CARLA multi-town caveat.** CARLA 0.9.16 on our setup reliably serves only **one
+> `load_world` per server process** — the second map load corrupts the streaming subsystem and
+> the server native-crashes. The sweep therefore covers Town01 (a full weather × time-of-day
+> study); cross-town evaluation (Town02/03/05) needs a fresh server booted per town and is left
+> as future work. `benchmark.py`/`run_sweep.py` already contain the per-town rotation scaffolding.
+
+---
+
 ## Project Structure
 
 ```
@@ -252,11 +304,16 @@ OpenEMMA-UI/
 ├── README.md                    # This file
 ├── LICENSE                      # Apache 2.0
 ├── requirements.txt             # Python dependencies
-├── openemmaUI.py                # Main launcher & agent (route + VLM CoT)
+├── openemmaUI.py                # Main launcher & agent (VLM CoT steering + scaffolding)
+├── benchmark.py                 # Headless closed-loop sweep (LLaMA, one town/invocation)
+├── run_sweep.py                 # CARLA restart supervisor + per-town rotation
+├── aggregate_results.py         # Condition/town/weather rollups -> summary.csv
+├── benchmark_results/           # Town01 sweep CSV + summary.csv
 ├── VLM_Model_Comparison.md      # Detailed VLM benchmark results
 ├── ui_common/                   # Shared UI & simulation framework
 │   ├── __init__.py
 │   ├── agent_runner.py          # AgentRunner + SafetyLimiter
+│   ├── trajectory.py            # OpenEMMA curvature integration (ported verbatim)
 │   ├── panel.py                 # InfoPanel (speed, steer, LLM I/O)
 │   ├── camera.py                # ChaseCameraManager
 │   ├── renderer.py              # UIRenderer (compositor)
@@ -329,7 +386,7 @@ OpenEMMA-UI/
 - **Hallucination in smaller models**: LLaVA-v1.5-7b and Qwen2-VL-7B persistently predict "stop" or "red traffic light" on empty roads in measured runs, causing unnecessary stops. Use LLaMA-3.2-11B or GPT-4o for more reliable scene understanding.
 - **Single-frame local VLM input**: The CARLA port sends one current frame to local models, not a 10-frame sequence, matching OpenEMMA's local-model branch.
 - **LLaMA VRAM/stability**: The 11B Llama backend needs `--4bit` to keep VRAM low enough for the CARLA server to stay stable alongside the model on a ~32 GB GPU.
-- **Single-town evaluation**: Current benchmarks are conducted on Town01. Results may vary on more complex maps (Town03, Town05) with different traffic patterns.
+- **Single-town evaluation (CARLA constraint)**: The closed-loop benchmark covers Town01 only. CARLA 0.9.16 on our setup reliably serves just one `load_world` per server process — the second map load corrupts the streaming subsystem and native-crashes the server — so cross-town sweeps (Town02/03/05) require a fresh server booted per town and are left as future work. The per-town rotation scaffolding already exists in `benchmark.py`/`run_sweep.py`.
 - **No multi-agent traffic**: Testing is performed with CARLA's default traffic manager. Dense traffic scenarios have not been extensively evaluated.
 - **Windows-only testing**: While the codebase should work on Linux, it has only been tested on Windows 11.
 

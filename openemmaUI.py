@@ -146,7 +146,7 @@ class OpenEMMACarlaAgent:
     # Speed parameters
     CRUISE_SPEED = 4.5      # m/s (~16 km/h) - default target
     MAX_SPEED = 5.5         # m/s (~20 km/h) - max allowed
-    MIN_DRIVE_SPEED = 2.5   # m/s - standing-start floor
+    MIN_DRIVE_SPEED = 4.5   # m/s - standing-start floor
     TURN_SPEED = 2.5        # m/s (~9 km/h) - speed in sharp turns
     CURVE_SPEED = 3.8       # m/s (~14 km/h) - moderate curves
     SANE_MAX_SPEED_MPS = 8.0
@@ -156,6 +156,28 @@ class OpenEMMACarlaAgent:
     LOOK_AHEAD_FAR = 22     # far target for turn anticipation
     LOOK_AHEAD_M = 4.0      # VLM trajectory look-ahead in ego-local meters
     STEER_GAIN = 1.3        # steering responsiveness
+    OFFROAD_RECOVERY_DIST_M = 2.5
+    OFFROAD_RECOVERY_FRAMES = 8
+
+    @staticmethod
+    def _fresh_metrics():
+        return {
+            'frames': 0,
+            'vlm_frames': 0,
+            'fallback_frames': 0,
+            'speed_floor_frames': 0,
+            'speed_clamp_events': 0,
+            'curv_clamp_events': 0,
+            'degenerate_rejections': 0,
+            'stuck_events': 0,
+            'recovery_events': 0,
+            'route_regens': 0,
+            'cot_cycles': 0,
+            'cot_stop_or_red': 0,
+            'steer_sum': 0.0,
+            'steer_sq_sum': 0.0,
+            'speed_sum': 0.0,
+        }
 
     def __init__(self, model_path, device='cuda', use_4bit=False, debug=False):
         self.model_path = model_path
@@ -199,6 +221,7 @@ class OpenEMMACarlaAgent:
 
         # Stuck recovery
         self._stuck_counter = 0
+        self._offroad_counter = 0
         self._recovery_counter = 0
         self._realign_counter = 0
         self._recovery_steer = 0.0
@@ -216,12 +239,73 @@ class OpenEMMACarlaAgent:
         self.ui_red_light = False
         self.ui_violations = {}
 
+        # Cheap always-on counters used by the headless benchmark harness.
+        self.metrics = self._fresh_metrics()
+
         # VLM components
         self.model = None
         self.processor = None
         self.tokenizer = None
 
         self._load_model()
+
+    def reset_run_state(self):
+        """Reset per-run state while keeping the loaded model in memory."""
+        self.step = 0
+        self.route = None
+        self._route_idx = 0
+
+        self.prev_intent = ''
+        self.last_scene = ''
+        self.last_objects = ''
+        self.last_intent = ''
+        self.last_motion_raw = ''
+
+        self._ego_history_positions = []
+        with self._cot_lock:
+            self._cot_running = False
+            self.obs_positions = None
+            self.obs_velocities = None
+            self.obs_vel_norm = None
+            self.obs_curvatures = None
+            self.obs_initial_heading = 0.0
+            self.obs_sample_count = 0
+            self.vlm_traj = None
+            self.vlm_pred_speeds = None
+            self.vlm_pred_curvatures = None
+
+        self.prev_steer = 0.0
+        self._stuck_counter = 0
+        self._offroad_counter = 0
+        self._recovery_counter = 0
+        self._realign_counter = 0
+        self._recovery_steer = 0.0
+        self._stuck_recovery_events = 0
+        self._last_recovery_route_idx = None
+        self._last_vlm_dbg_source = None
+
+        self.curr_instruction = ''
+        self.curr_notice = ''
+        self.ui_waypoints = None
+        self.ui_desired_speed = 0.0
+        self.ui_curvature = 0.0
+        self.ui_red_light = False
+        self.ui_violations = {}
+
+        self.metrics = self._fresh_metrics()
+
+    def get_metrics_snapshot(self):
+        """Return benchmark counters plus route progress."""
+        snapshot = self.metrics.copy()
+        snapshot['route_idx'] = self._route_idx
+        snapshot['route_len'] = len(self.route) if self.route else 0
+        return snapshot
+
+    def _record_frame_metrics(self, steer, current_speed):
+        self.metrics['frames'] += 1
+        self.metrics['steer_sum'] += float(steer)
+        self.metrics['steer_sq_sum'] += float(steer) * float(steer)
+        self.metrics['speed_sum'] += abs(float(current_speed))
 
     def set_route(self, world_route):
         """Set the route for pure-pursuit steering."""
@@ -234,7 +318,7 @@ class OpenEMMACarlaAgent:
         """Store runner reference for route regeneration."""
         self._runner = runner
 
-    def _regenerate_route(self):
+    def _regenerate_route(self, count_metric=False):
         """Generate a new random route from current position."""
         runner = getattr(self, '_runner', None)
         vehicle = getattr(self, '_vehicle', None)
@@ -253,6 +337,8 @@ class OpenEMMACarlaAgent:
             start_location=current_loc, end_location=dest.location)
         self.set_route(world_route)
         runner.safety_limiter.set_route(world_route)
+        if count_metric:
+            self.metrics['route_regens'] += 1
         print(f'[OpenEMMA] New route: {len(world_route)} waypoints')
 
     def _load_model(self):
@@ -545,6 +631,42 @@ class OpenEMMACarlaAgent:
 
         return float(np.clip(steer * self.STEER_GAIN, -1.0, 1.0))
 
+    def _update_offroad_recovery_trigger(self, vehicle):
+        """Trigger recovery after the vehicle center leaves a driving lane."""
+        if (
+            vehicle is None
+            or self._recovery_counter > 0
+            or self._realign_counter > 0
+        ):
+            return
+
+        runner = getattr(self, '_runner', None)
+        world = getattr(runner, 'world', None)
+        if world is None:
+            return
+
+        try:
+            carla_map = world.get_map()
+            veh_loc = vehicle.get_location()
+            wp = carla_map.get_waypoint(
+                veh_loc,
+                project_to_road=False,
+            )
+        except Exception:
+            return
+
+        is_offroad = wp is None or wp.lane_type != carla.LaneType.Driving
+        if is_offroad:
+            self._offroad_counter += 1
+        else:
+            self._offroad_counter = max(0, self._offroad_counter - 1)
+
+        if self._offroad_counter >= self.OFFROAD_RECOVERY_FRAMES:
+            self.metrics['recovery_events'] += 1
+            self._recovery_counter = 25
+            self._realign_counter = 0
+            self._offroad_counter = 0
+
     def _compute_route_curvature(self):
         """Estimate upcoming route curvature for speed adaptation.
 
@@ -750,6 +872,9 @@ class OpenEMMACarlaAgent:
             control.brake = 1.0
             return control
 
+        if self._recovery_counter == 0 and self._realign_counter == 0:
+            self._update_offroad_recovery_trigger(vehicle)
+
         if self._recovery_counter > 0:
             self._recovery_counter -= 1
             if vehicle is not None:
@@ -765,6 +890,7 @@ class OpenEMMACarlaAgent:
             self.curr_instruction = "Road recovery reverse"
             self.ui_desired_speed = self.TURN_SPEED
             self.ui_curvature = 0.0
+            self._record_frame_metrics(control.steer, current_speed)
             return control
 
         if self._realign_counter > 0:
@@ -782,6 +908,7 @@ class OpenEMMACarlaAgent:
             self.ui_curvature = 0.0
             if self._realign_counter == 0:
                 self._stuck_counter = 0
+            self._record_frame_metrics(control.steer, current_speed)
             return control
 
         is_red = getattr(self, 'ui_red_light', False)
@@ -835,6 +962,7 @@ class OpenEMMACarlaAgent:
         if vlm_result is not None:
             steer, target_speed, ui_curvature, _ = vlm_result
             control_source = "VLM trajectory"
+            self.metrics['vlm_frames'] += 1
             self._set_ui_waypoints_from_vlm(vlm_traj)
         else:
             steer, target_speed = self._route_fallback_control(
@@ -842,6 +970,7 @@ class OpenEMMACarlaAgent:
             )
             ui_curvature = route_curvature
             control_source = "Route fallback"
+            self.metrics['fallback_frames'] += 1
             if vehicle is not None and self.route:
                 self._generate_route_waypoints(vehicle)
 
@@ -853,8 +982,11 @@ class OpenEMMACarlaAgent:
             or 'red' in intent_lower
         )
         legitimate_stop = is_red or explicit_stop
+        target_speed_before_floor = target_speed
         if not legitimate_stop:
             target_speed = max(target_speed, self.MIN_DRIVE_SPEED)
+            if target_speed_before_floor < self.MIN_DRIVE_SPEED:
+                self.metrics['speed_floor_frames'] += 1
 
         steer_diff = abs(steer - self.prev_steer)
         if steer_diff > 0.15:
@@ -880,6 +1012,8 @@ class OpenEMMACarlaAgent:
             self._stuck_counter = max(0, self._stuck_counter - 2)
 
         if self._stuck_counter > 40:
+            self.metrics['stuck_events'] += 1
+            self.metrics['recovery_events'] += 1
             old_idx = self._route_idx
             if (
                 self._last_recovery_route_idx is not None
@@ -893,7 +1027,7 @@ class OpenEMMACarlaAgent:
             if self._stuck_recovery_events >= 3:
                 print(f'[OpenEMMA] Stuck recovery loop at step {self.step}, '
                       f'route_idx {old_idx}, regenerating route...')
-                self._regenerate_route()
+                self._regenerate_route(count_metric=True)
                 self._stuck_recovery_events = 0
                 self._last_recovery_route_idx = None
             else:
@@ -925,6 +1059,7 @@ class OpenEMMACarlaAgent:
         self.ui_desired_speed = target_speed
         self.ui_curvature = ui_curvature
 
+        self._record_frame_metrics(control.steer, current_speed)
         return control
 
     def _generate_route_waypoints(self, vehicle):
@@ -973,6 +1108,7 @@ class OpenEMMACarlaAgent:
 
     def _run_cot_pipeline(self, image_path, current_speed):
         """Run the full Chain-of-Thought pipeline."""
+        self.metrics['cot_cycles'] += 1
 
         # Step 1: Scene Description (with image)
         scene = self._vlm_query(SCENE_PROMPT, image_path)
@@ -996,6 +1132,15 @@ class OpenEMMACarlaAgent:
         self.last_intent = intent.strip()[:150]
         self.prev_intent = self.last_intent
 
+        intent_lower = self.last_intent.lower()
+        scene_lower = self.last_scene.lower()
+        explicit_stop = (
+            'stop' in intent_lower
+            or 'red' in scene_lower
+            or 'red' in intent_lower
+        )
+        if explicit_stop:
+            self.metrics['cot_stop_or_red'] += 1
 
         # Step 4: Motion Prediction
         history = self._motion_history_string(current_speed)
@@ -1023,6 +1168,7 @@ class OpenEMMACarlaAgent:
 
         raw_pred_speeds = parsed[:, 0]
         raw_pred_speeds_mps = raw_pred_speeds / self.FRAME_DT
+        speed_clamped = bool(np.any(raw_pred_speeds_mps > self.SANE_MAX_SPEED_MPS))
         pred_speeds_mps = np.clip(
             raw_pred_speeds_mps,
             0.0,
@@ -1042,15 +1188,22 @@ class OpenEMMACarlaAgent:
             )
 
         pred_speeds = pred_speeds_mps * self.FRAME_DT
+        raw_curvatures = parsed[:, 1] / 100.0
+        curv_clamped = bool(np.any(np.abs(raw_curvatures) > self.SANE_MAX_CURV))
         pred_curvatures = np.clip(
-            parsed[:, 1] / 100.0,
+            raw_curvatures,
             -self.SANE_MAX_CURV,
             self.SANE_MAX_CURV,
         )
+        if speed_clamped:
+            self.metrics['speed_clamp_events'] += 1
+        if curv_clamped:
+            self.metrics['curv_clamp_events'] += 1
         raw_speed_preview = [round(float(v), 2) for v in raw_pred_speeds_mps[:3]]
         sane_speed_preview = [round(float(v), 2) for v in pred_speeds_mps[:3]]
 
         if len(pred_speeds_mps) == 0 or float(np.max(pred_speeds_mps)) < 0.1:
+            self.metrics['degenerate_rejections'] += 1
             if self.debug:
                 print(
                     f"[VLM-DBG] intent='{self.last_intent[:50]}' pairs={len(parsed)} "

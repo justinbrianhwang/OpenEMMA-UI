@@ -1,0 +1,13 @@
+town,weather_label,seed,duration_s,route_len,route_reached,completion_pct,distance_m,offroad_pct,collisions,stuck_events,recovery_events,route_regens,vlm_frame_pct,fallback_frame_pct,speed_floor_pct,speed_clamp_events,curv_clamp_events,degenerate_rejections,hallucination_pct,avg_speed_mps,steer_std,outcome
+Town01,ClearNoon,0,150.0,720,471,65.4167,461.7212,0.1,0,0,0,0,51.3369,48.6631,47.8275,0,0,1,0.0,3.0839,0.0893,timeout
+Town01,ClearNoon,1,150.0,700,405,57.8571,397.15,0.2333,0,0,0,0,65.8088,34.1912,58.7567,0,0,1,16.6667,2.6515,0.1126,timeout
+Town01,HardRainNoon,0,140.4,720,405,56.25,398.1235,7.6896,0,0,0,0,63.6429,36.3571,29.5357,1,0,1,40.0,2.84,0.1642,offroad_terminal
+Town01,HardRainNoon,1,150.0,700,451,64.4286,442.6498,0.1,0,0,0,0,76.4037,23.5963,30.0134,0,0,0,60.0,2.9556,0.2037,timeout
+Town01,WetCloudyNoon,0,59.45,720,71,9.8611,68.1956,16.8908,0,0,0,0,38.5267,61.4733,4.9111,1,0,1,33.3333,1.1525,0.119,offroad_terminal
+Town01,WetCloudyNoon,1,123.25,700,362,51.7143,354.6094,0.1217,1,0,0,0,72.9752,27.0248,26.1701,1,0,0,0.0,2.8836,0.0982,collision
+Town01,ClearSunset,0,150.0,720,405,56.25,398.0118,0.1,0,0,0,0,57.7206,42.2794,47.4933,0,0,1,16.6667,2.6579,0.1173,timeout
+Town01,ClearSunset,1,150.0,700,433,61.8571,425.8154,0.1,0,0,0,0,64.8061,35.1939,18.2152,0,0,1,50.0,2.8442,0.0866,timeout
+Town01,ClearNight,0,150.0,720,471,65.4167,463.9961,0.1,0,0,0,0,80.4144,19.5856,66.8115,1,0,0,0.0,3.098,0.1147,timeout
+Town01,ClearNight,1,150.0,700,409,58.4286,401.3836,0.1,0,0,0,0,51.9385,48.0615,24.1979,0,0,1,20.0,2.6812,0.0865,timeout
+Town01,HardRainNight,0,150.0,720,471,65.4167,462.4139,0.3332,0,0,0,0,79.5789,20.4211,27.7406,1,0,0,40.0,3.0878,0.1513,timeout
+Town01,HardRainNight,1,150.0,700,405,57.8571,398.1992,0.1,0,0,0,0,53.9104,46.0896,41.3102,0,0,1,20.0,2.6587,0.1193,timeout
