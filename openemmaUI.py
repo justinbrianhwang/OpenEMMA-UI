@@ -5,11 +5,11 @@ Adapts OpenEMMA (originally designed for nuScenes) to work with CARLA 0.9.16.
 Uses a VLM (Qwen2-VL, LLaVA, or GPT-4o) for chain-of-thought driving decisions.
 
 Architecture:
-    - Route-based pure-pursuit controller for steering (primary)
-    - VLM Chain-of-Thought for scene understanding (advisory, displayed in UI)
+    - VLM predicts future speed/curvature actions that are integrated to waypoints
+    - Per-frame controller follows the latest VLM trajectory
     - SafetyLimiter handles red lights, lane-keeping (in agent_runner)
 
-Pipeline: Scene Description → Critical Objects → Driving Intent → Motion Prediction
+Pipeline: Scene Description -> Critical Objects -> Driving Intent -> Motion Prediction
 The full CoT reasoning is displayed in the UI panel.
 
 Usage:
@@ -33,7 +33,7 @@ import argparse
 import re
 import threading
 
-# ── CARLA 0.9.16 PythonAPI setup (must be first) ──
+# CARLA 0.9.16 PythonAPI setup (must be first)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ui_common'))
 from carla_setup import setup_carla_paths
 setup_carla_paths()
@@ -41,15 +41,21 @@ setup_carla_paths()
 import carla
 import numpy as np
 
-# ── Path setup for OpenEMMA ──
+# Path setup for OpenEMMA
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-OPENEMMA_ROOT = os.path.join(PROJECT_ROOT, 'OpenEMMA')
+OPENEMMA_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, '..', 'OpenEMMA'))
+if not os.path.isdir(OPENEMMA_ROOT):
+    OPENEMMA_ROOT = os.path.join(PROJECT_ROOT, 'OpenEMMA')
 if OPENEMMA_ROOT not in sys.path:
     sys.path.insert(0, OPENEMMA_ROOT)
 
 from ui_common.agent_runner import AgentRunner
+from ui_common.trajectory import (
+    EstimateCurvatureFromTrajectory,
+    IntegrateCurvatureForPoints,
+)
 
-# ── Default local model paths (in OpenEMMA/local/) ──
+# Default local model paths (in OpenEMMA/local/)
 LOCAL_MODEL_DIR = os.path.join(OPENEMMA_ROOT, 'local')
 LOCAL_MODELS = {
     'qwen': os.path.join(LOCAL_MODEL_DIR, 'Qwen2-VL-7B-Instruct'),
@@ -58,9 +64,7 @@ LOCAL_MODELS = {
 }
 
 
-# ─────────────────────────────────────────────
 # Chain-of-Thought Prompt Templates
-# ─────────────────────────────────────────────
 
 SCENE_PROMPT = (
     "You are an autonomous vehicle driving in a virtual city (CARLA simulator). "
@@ -84,46 +88,62 @@ INTENT_PROMPT_TEMPLATE = (
 )
 
 MOTION_SYSTEM = (
-    "You are an autonomous driving motion planner in CARLA simulator. "
-    "Given the scene understanding and driving intent, predict the ego vehicle's "
-    "future trajectory as speed and curvature pairs for the next 3 seconds. "
-    "Output format: speed_1,curvature_1;speed_2,curvature_2;speed_3,curvature_3\n"
-    "- speed: m/s (0-15), curvature: turning rate (-0.15 to 0.15, negative=left, positive=right, 0=straight)\n"
-    "- If red light or obstacle: predict speed=0\n"
-    "- Output ONLY the numbers, no explanation."
+    "You are a autonomous driving labeller. You have access to a front-view "
+    "camera image of a vehicle, a sequence of past speeds, a sequence of past "
+    "curvatures, and a driving rationale. Each speed, curvature is represented "
+    "as [v, k], where v corresponds to the speed, and k corresponds to the "
+    "curvature. A positive k means the vehicle is turning left. A negative k "
+    "means the vehicle is turning right. The larger the absolute value of k, "
+    "the sharper the turn. A close to zero k means the vehicle is driving "
+    "straight. As a driver on the road, you should follow any common sense "
+    "traffic rules. You should try to stay in the middle of your lane. You "
+    "should maintain necessary distance from the leading vehicle. You should "
+    "observe lane markings and follow them. Your task is to do your best to "
+    "predict future speeds and curvatures for the vehicle over the next 10 "
+    "timesteps given vehicle intent inferred from the image. Make a best guess "
+    "if the problem is too difficult for you."
 )
 
 MOTION_PROMPT_TEMPLATE = (
-    "Current speed: {speed:.1f} m/s.\n"
-    "Scene: {scene}\n"
-    "Objects: {objects}\n"
-    "Intent: {intent}\n"
-    "Predict speed,curvature for next 3 seconds:"
+    "These are frames from a video taken by a camera mounted in the front of a "
+    "car. The images are taken at a 0.5 second interval.\n"
+    "The scene is described as follows: {scene}.\n"
+    "The identified critical objects are {objects}.\n"
+    "The car's intent is {intent}.\n"
+    "The 5 second historical velocities and curvatures of the ego car are "
+    "{history}.\n"
+    "Infer the association between these numbers and the image sequence. "
+    "Generate the predicted future speeds and curvatures in the format "
+    "[speed_1, curvature_1], [speed_2, curvature_2],..., "
+    "[speed_10, curvature_10]. Write the raw text not markdown or latex. "
+    "Future speeds and curvatures:"
 )
 
 
-# ─────────────────────────────────────────────
 # OpenEMMA CARLA Adapter
-# ─────────────────────────────────────────────
 
 class OpenEMMACarlaAgent:
     """
     Adapts OpenEMMA's VLM-based driving pipeline to work as a CARLA agent.
 
     Control Strategy:
-    - PRIMARY: Route-based pure-pursuit steering + cruise speed
-    - ADVISORY: VLM CoT provides scene understanding for UI display
-    - VLM intent can modulate speed (slow down / speed up)
+    - PRIMARY: VLM-predicted speed/curvature actions integrated to a trajectory
+    - FALLBACK: Route pure-pursuit before the first valid VLM trajectory
     - SafetyLimiter handles actual red lights and lane-keeping
 
     Full Chain-of-Thought pipeline (runs every N frames):
     1. Scene Description - what's in the driving scene
     2. Critical Objects - what to pay attention to
     3. Driving Intent - what should the car do
-    4. Motion Prediction - speed/curvature for next 3 seconds
+    4. Motion Prediction - 10 future speed/curvature actions at 0.5s spacing
     """
 
-    # Cruise speed parameters
+    OBS_LEN = 10
+    FUT_LEN = 10
+    FRAME_DT = 0.5
+    HISTORY_SAMPLE_FRAMES = 10
+
+    # Speed parameters
     CRUISE_SPEED = 4.5      # m/s (~16 km/h) - default target
     MAX_SPEED = 5.5         # m/s (~20 km/h) - max allowed
     TURN_SPEED = 2.5        # m/s (~9 km/h) - speed in sharp turns
@@ -131,6 +151,7 @@ class OpenEMMACarlaAgent:
     # Route steering (dual look-ahead)
     LOOK_AHEAD_NEAR = 12    # near target for lane centering
     LOOK_AHEAD_FAR = 22     # far target for turn anticipation
+    LOOK_AHEAD_M = 4.0      # VLM trajectory look-ahead in ego-local meters
     STEER_GAIN = 1.3        # steering responsiveness
 
     def __init__(self, model_path, device='cuda', use_4bit=False):
@@ -150,9 +171,20 @@ class OpenEMMACarlaAgent:
         self.last_intent = ''
         self.last_motion_raw = ''
 
-        # VLM speed/curvature predictions
-        self.vlm_speed = None
-        self.vlm_curvature = None
+        # Ego history sampled every 0.5s. Speeds are per-frame displacement
+        # magnitudes in meters, matching OpenEMMA's OBS_LEN/FUT_LEN convention.
+        self._ego_history_positions = []
+        self.obs_positions = None
+        self.obs_velocities = None
+        self.obs_vel_norm = None
+        self.obs_curvatures = None
+        self.obs_initial_heading = 0.0
+        self.obs_sample_count = 0
+
+        # VLM trajectory in ego-local coordinates: +x forward, +y left.
+        self.vlm_traj = None
+        self.vlm_pred_speeds = None  # m/s, converted from 0.5s displacement
+        self.vlm_pred_curvatures = None
 
         # Async VLM inference
         self._cot_running = False
@@ -484,33 +516,184 @@ class OpenEMMACarlaAgent:
                 max_curv = max(max_curv, curv)
         return max_curv
 
-    def run_step(self, input_data, timestamp):
-        """Execute one step of OpenEMMA driving.
+    def _update_ego_history(self, vehicle):
+        """Sample ego pose every 0.5s and derive OpenEMMA motion history."""
+        if vehicle is None or self.step % self.HISTORY_SAMPLE_FRAMES != 0:
+            return
 
-        Uses route-based steering as primary control.
-        VLM CoT runs every 20 frames for scene understanding (UI display).
-        """
+        loc = vehicle.get_location()
+        pos = np.array([loc.x, loc.y], dtype=float)
+        self._ego_history_positions.append(pos)
+        self._ego_history_positions = self._ego_history_positions[-self.OBS_LEN:]
+
+        positions = np.asarray(self._ego_history_positions, dtype=float)
+        velocities = np.empty((0, 2), dtype=float)
+        vel_norm = np.empty((0,), dtype=float)
+        curvatures = np.zeros(len(positions), dtype=float)
+        heading = self.obs_initial_heading
+
+        if len(positions) >= 2:
+            velocities = positions[1:] - positions[:-1]
+            vel_norm = np.linalg.norm(velocities, axis=1)
+            curvatures = EstimateCurvatureFromTrajectory(positions)
+            last_velocity = velocities[-1]
+            if np.linalg.norm(last_velocity) > 1e-6:
+                heading = math.atan2(last_velocity[1], last_velocity[0])
+
+        with self._cot_lock:
+            self.obs_positions = positions
+            self.obs_velocities = velocities
+            self.obs_vel_norm = vel_norm
+            self.obs_curvatures = curvatures
+            self.obs_initial_heading = heading
+            self.obs_sample_count = len(positions)
+
+    def _motion_history_string(self, current_speed):
+        """Return OpenEMMA [speed, curvature*100] history string."""
+        with self._cot_lock:
+            sample_count = self.obs_sample_count
+            vel_norm = None if self.obs_vel_norm is None else self.obs_vel_norm.copy()
+            curvatures = None if self.obs_curvatures is None else self.obs_curvatures.copy()
+
+        if sample_count >= self.OBS_LEN and vel_norm is not None and curvatures is not None:
+            pairs = zip(vel_norm, curvatures)
+            return ", ".join(f"[{v:.1f},{c * 100:.1f}]" for v, c in pairs)
+
+        # Cold-start fallback: speed here must be a 0.5s displacement, not m/s.
+        fallback_speed = abs(float(current_speed)) * self.FRAME_DT
+        return ", ".join(
+            f"[{fallback_speed:.1f},{0.0:.1f}]"
+            for _ in range(self.OBS_LEN - 1)
+        )
+
+    def _parse_motion_pairs(self, response):
+        """Parse up to FUT_LEN [speed, curvature] pairs from raw VLM text."""
+        pattern = r'\[([-+]?\d*\.?\d+),\s*([-+]?\d*\.?\d+)\]'
+        pairs = re.findall(pattern, response or "")
+        if not pairs:
+            return None
+        parsed = np.asarray(
+            [[float(speed), float(curvature)] for speed, curvature in pairs[:self.FUT_LEN]],
+            dtype=float,
+        )
+        if parsed.size == 0 or not np.all(np.isfinite(parsed)):
+            return None
+        return parsed
+
+    def _pursue_vlm_trajectory(self, traj, pred_speeds, pred_curvatures, current_speed):
+        """Return steer/speed from ego-local VLM waypoints (+x forward, +y left)."""
+        if traj is None or pred_speeds is None or len(traj) == 0:
+            return None
+
+        traj = np.asarray(traj, dtype=float)
+        pred_speeds = np.asarray(pred_speeds, dtype=float)
+        if traj.ndim != 2 or traj.shape[1] < 2 or len(pred_speeds) == 0:
+            return None
+        if not np.all(np.isfinite(traj)) or not np.all(np.isfinite(pred_speeds)):
+            return None
+
+        look_ahead = max(self.LOOK_AHEAD_M, min(12.0, abs(current_speed) * 1.5))
+        candidates = np.where((traj[:, 0] >= look_ahead) & (traj[:, 0] > 0.0))[0]
+        if len(candidates) > 0:
+            idx = int(candidates[0])
+        else:
+            idx = int(np.argmax(np.linalg.norm(traj[:, :2], axis=1)))
+
+        forward = float(traj[idx, 0])
+        lateral = float(traj[idx, 1])
+        if abs(forward) < 0.5 and abs(lateral) < 0.5:
+            steer = 0.0
+        else:
+            angle = math.atan2(lateral, max(forward, 0.1))
+            # OpenEMMA local +y is left; this UI/CARLA controller uses negative steer for left.
+            steer = -angle / (math.pi / 2.0) * self.STEER_GAIN
+            steer = float(np.clip(steer, -0.7, 0.7))
+
+        speed_idx = min(idx, len(pred_speeds) - 1)
+        target_speed = float(np.clip(pred_speeds[speed_idx], 0.0, self.MAX_SPEED))
+
+        curvature = 0.0
+        if pred_curvatures is not None and len(pred_curvatures) > 0:
+            curv_idx = min(idx, len(pred_curvatures) - 1)
+            curvature = float(pred_curvatures[curv_idx])
+
+        return steer, target_speed, curvature, idx
+
+    def _route_fallback_control(self, route_steer, route_valid, route_curvature):
+        """Cold-start fallback before a valid VLM trajectory exists."""
+        steer_mag = abs(route_steer)
+        if route_curvature > 0.3 or steer_mag > 0.5:
+            target_speed = self.TURN_SPEED
+        elif route_curvature > 0.12 or steer_mag > 0.25:
+            curve_factor = max(route_curvature / 0.3, steer_mag / 0.5)
+            curve_factor = min(curve_factor, 1.0)
+            target_speed = self.CRUISE_SPEED - curve_factor * (self.CRUISE_SPEED - self.CURVE_SPEED)
+        else:
+            target_speed = self.CRUISE_SPEED
+
+        if route_valid:
+            steer = route_steer
+        else:
+            steer = self.prev_steer * 0.9
+        return steer, target_speed
+
+    def _apply_speed_control(self, control, target_speed, current_speed):
+        """Proportional longitudinal control toward target_speed in m/s."""
+        if target_speed <= 0.05:
+            control.throttle = 0.0
+            control.brake = 0.6 if abs(current_speed) > 0.2 else 0.3
+            return
+
+        speed_error = target_speed - abs(current_speed)
+        if speed_error > 0.3:
+            control.throttle = float(np.clip(speed_error * 0.3, 0.1, 0.75))
+            control.brake = 0.0
+        elif speed_error < -0.1:
+            control.throttle = 0.0
+            control.brake = float(np.clip(-speed_error * 0.5, 0.1, 1.0))
+        else:
+            control.throttle = 0.15
+            control.brake = 0.0
+
+    def _set_ui_waypoints_from_vlm(self, traj):
+        """Convert VLM [forward, left] waypoints to panel [right, forward]."""
+        if traj is None or len(traj) == 0:
+            self.ui_waypoints = None
+            return
+
+        traj = np.asarray(traj, dtype=float)
+        if len(traj) > 5:
+            start = 1 if len(traj) > 1 else 0
+            sample_idx = np.linspace(start, len(traj) - 1, min(5, len(traj) - start), dtype=int)
+            sampled = traj[sample_idx]
+        else:
+            sampled = traj
+
+        self.ui_waypoints = np.column_stack((-sampled[:, 1], sampled[:, 0]))
+
+    def run_step(self, input_data, timestamp):
+        """Execute one step using VLM trajectory primary control."""
         self.step += 1
         control = carla.VehicleControl()
 
-        # First few steps: brake to stabilize
-        if self.step < 10:
-            control.brake = 1.0
-            return control
-
-        # Get current speed
         speed = input_data.get('speed', (0, {'speed': 0.0}))[1]
         if isinstance(speed, dict):
             speed = speed.get('speed', 0.0)
         current_speed = float(speed)
 
-        # ── Stuck recovery: if speed near 0 for too long, reverse briefly ──
+        vehicle = getattr(self, '_vehicle', None)
+        self._update_ego_history(vehicle)
+
+        # First few steps: brake to stabilize before either controller acts.
+        if self.step < 10:
+            control.brake = 1.0
+            return control
+
         if self._recovery_counter > 0:
             self._recovery_counter -= 1
             control.throttle = 0.5
             control.brake = 0.0
             control.reverse = True
-            # Steer away from wall: use route direction after reset
             control.steer = self._recovery_steer
             if self._recovery_counter == 0:
                 self._stuck_counter = 0
@@ -523,26 +706,20 @@ class OpenEMMACarlaAgent:
         else:
             self._stuck_counter = max(0, self._stuck_counter - 2)
 
-        if self._stuck_counter > 40:  # ~2 seconds stuck
-            # Reset _route_idx backward to re-find the turn we missed
+        if self._stuck_counter > 40:
             old_idx = self._route_idx
             self._route_idx = max(0, self._route_idx - 40)
             print(f'[OpenEMMA] Stuck at step {self.step}, '
-                  f'route_idx {old_idx}→{self._route_idx}, reversing...')
-            # Compute recovery steer: steer toward next route point
-            self._recovery_steer = 0.3  # default slight right
-            vehicle = getattr(self, '_vehicle', None)
+                  f'route_idx {old_idx}->{self._route_idx}, reversing...')
+            self._recovery_steer = 0.3
             if vehicle is not None:
                 rs, valid = self._get_route_steer(vehicle)
                 if valid:
-                    self._recovery_steer = -rs  # reverse steer = opposite
-            self._recovery_counter = 25  # ~1.2 seconds reverse
+                    self._recovery_steer = -rs
+            self._recovery_counter = 25
             self._stuck_counter = 0
 
-        # Save front camera image and launch async VLM inference
         rgb_data = input_data.get('rgb_front', (0, None))[1]
-
-        # Launch CoT in background thread every 20 frames (non-blocking)
         if rgb_data is not None and self.step % 20 == 0 and not self._cot_running:
             try:
                 import cv2
@@ -561,94 +738,66 @@ class OpenEMMACarlaAgent:
                 self._cot_running = False
                 print(f'[OpenEMMA] CoT launch error: {e}')
 
-        # ── PRIMARY CONTROL: Route-based steering + cruise speed ──
+        # Route is maintained for cold-start fallback, route regeneration, and
+        # SafetyLimiter junction assist. It is not the primary controller here.
         route_steer = 0.0
         route_valid = False
-
-        # Get vehicle reference for route steering
-        vehicle = getattr(self, '_vehicle', None)
+        route_curvature = 0.0
         if vehicle is not None:
             route_steer, route_valid = self._get_route_steer(vehicle)
             route_curvature = self._compute_route_curvature()
-        else:
-            route_curvature = 0.0
 
-        # ── Route end: generate new random route ──
         route_remaining = len(self.route) - self._route_idx if self.route else 999
         if route_remaining < 20:
             self._regenerate_route()
-            # Re-compute steer with new route
             if vehicle is not None:
                 route_steer, route_valid = self._get_route_steer(vehicle)
                 route_curvature = self._compute_route_curvature()
 
-        # Determine target speed based on upcoming curvature + current steer
-        steer_mag = abs(route_steer)
-        if route_curvature > 0.3 or steer_mag > 0.5:
-            # Sharp turn (intersection/U-turn)
-            target_speed = self.TURN_SPEED
-        elif route_curvature > 0.12 or steer_mag > 0.25:
-            # Moderate curve - proportional slowdown
-            curve_factor = max(route_curvature / 0.3, steer_mag / 0.5)
-            curve_factor = min(curve_factor, 1.0)
-            target_speed = self.CRUISE_SPEED - curve_factor * (self.CRUISE_SPEED - self.CURVE_SPEED)
+        with self._cot_lock:
+            vlm_traj = None if self.vlm_traj is None else self.vlm_traj.copy()
+            vlm_speeds = None if self.vlm_pred_speeds is None else self.vlm_pred_speeds.copy()
+            vlm_curvatures = (
+                None if self.vlm_pred_curvatures is None
+                else self.vlm_pred_curvatures.copy()
+            )
+
+        vlm_result = self._pursue_vlm_trajectory(
+            vlm_traj, vlm_speeds, vlm_curvatures, current_speed
+        )
+        if vlm_result is not None:
+            steer, target_speed, ui_curvature, _ = vlm_result
+            control_source = "VLM trajectory"
+            self._set_ui_waypoints_from_vlm(vlm_traj)
         else:
-            target_speed = self.CRUISE_SPEED
+            steer, target_speed = self._route_fallback_control(
+                route_steer, route_valid, route_curvature
+            )
+            ui_curvature = route_curvature
+            control_source = "Route fallback"
+            if vehicle is not None and self.route:
+                self._generate_route_waypoints(vehicle)
 
-        # VLM advisory: modulate speed based on intent
-        intent_lower = self.last_intent.lower()
-        if 'slow' in intent_lower:
-            target_speed = min(target_speed, 3.0)
-        elif 'speed up' in intent_lower:
-            target_speed = min(target_speed + 2.0, self.MAX_SPEED)
-
-        # Steering: use route steering as primary
-        if route_valid:
-            steer = route_steer
-        else:
-            # Route invalid: keep last steer direction (NOT VLM fallback which causes flip-flops)
-            steer = self.prev_steer * 0.9  # gently decay toward straight
-
-        # Adaptive smoothing: stable on straights, responsive on curves
         steer_diff = abs(steer - self.prev_steer)
         if steer_diff > 0.15:
-            # Curve entry/exit: fast response
             alpha = 0.15
         elif steer_diff > 0.05:
-            # Moderate correction
             alpha = 0.35
         else:
-            # Straight: smooth/stable
             alpha = 0.5
         steer = alpha * self.prev_steer + (1.0 - alpha) * steer
         self.prev_steer = steer
         control.steer = steer
 
-        # Speed control (proportional)
-        speed_error = target_speed - abs(current_speed)
-        if speed_error > 0.3:
-            # Need to accelerate
-            control.throttle = float(np.clip(speed_error * 0.3, 0.1, 0.75))
-            control.brake = 0.0
-        elif speed_error < -0.1:
-            # Need to slow down (brake proportional to overspeed)
-            control.throttle = 0.0
-            control.brake = float(np.clip(-speed_error * 0.5, 0.1, 1.0))
-        else:
-            # Near target: gentle throttle to maintain
-            control.throttle = 0.15
-            control.brake = 0.0
+        self._apply_speed_control(control, target_speed, current_speed)
 
-        # Update UI attributes
-        self.curr_instruction = f"Intent: {self.last_intent[:80]}" if self.last_intent else "Route following"
+        self.curr_instruction = (
+            f"Intent: {self.last_intent[:80]}" if self.last_intent else control_source
+        )
         if self.last_scene:
             self.curr_notice = self.last_scene[:100]
-        self.ui_desired_speed = target_speed * 3.6
-        self.ui_curvature = route_curvature
-
-        # Generate UI waypoints from route
-        if vehicle is not None and self.route:
-            self._generate_route_waypoints(vehicle)
+        self.ui_desired_speed = target_speed
+        self.ui_curvature = ui_curvature
 
         return control
 
@@ -723,32 +872,47 @@ class OpenEMMACarlaAgent:
 
 
         # Step 4: Motion Prediction
+        history = self._motion_history_string(current_speed)
         motion_prompt = MOTION_SYSTEM + "\n" + MOTION_PROMPT_TEMPLATE.format(
-            speed=abs(current_speed),
             scene=self.last_scene,
             objects=self.last_objects,
             intent=self.last_intent,
+            history=history,
         )
-        motion_response = self._vlm_query_text(motion_prompt)
-        self.last_motion_raw = motion_response.strip()[:100]
+        parsed = None
+        motion_response = ""
+        for _ in range(3):
+            motion_response = self._vlm_query(motion_prompt, image_path)
+            self.last_motion_raw = (motion_response or "").strip()[:100]
+            parsed = self._parse_motion(motion_response)
+            if parsed is not None:
+                break
 
+        if parsed is None:
+            with self._cot_lock:
+                self.vlm_traj = None
+                self.vlm_pred_speeds = None
+                self.vlm_pred_curvatures = None
+            return
 
-        self._parse_motion(motion_response)
+        pred_speeds = parsed[:, 0]
+        pred_curvatures = parsed[:, 1] / 100.0
+        traj = IntegrateCurvatureForPoints(
+            pred_curvatures,
+            pred_speeds,
+            (0.0, 0.0),
+            0.0,
+            len(pred_speeds),
+        )
+
+        with self._cot_lock:
+            self.vlm_traj = traj
+            self.vlm_pred_speeds = pred_speeds / self.FRAME_DT
+            self.vlm_pred_curvatures = pred_curvatures
 
     def _parse_motion(self, response):
-        """Parse speed and curvature predictions from VLM response."""
-        try:
-            numbers = re.findall(r'[-+]?\d*\.?\d+', response)
-            if len(numbers) >= 2:
-                self.vlm_speed = float(np.clip(float(numbers[0]), 0, 15))
-                self.vlm_curvature = float(np.clip(float(numbers[1]), -0.15, 0.15))
-            else:
-                intent_lower = self.last_intent.lower()
-                if 'stop' in intent_lower or 'red' in intent_lower:
-                    self.vlm_speed = 0.0
-                    self.vlm_curvature = 0.0
-        except Exception:
-            pass
+        """Parse VLM [speed, curvature] actions without changing controller state."""
+        return self._parse_motion_pairs(response)
 
     def destroy(self):
         """Cleanup."""
