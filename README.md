@@ -18,7 +18,7 @@ OpenEMMA was originally designed for offline trajectory prediction on the nuScen
 
 ## Features
 
-- **Real-time CARLA driving** with route-based pure-pursuit controller
+- **Real-time CARLA driving** with VLM-trajectory steering, route fallback, and safety backstops
 - **4-step Chain-of-Thought pipeline** displayed in UI:
   1. Scene Description
   2. Critical Object Detection
@@ -51,9 +51,10 @@ openemmaUI.py                    # Main launcher & OpenEMMA agent
 ```
 
 **Control flow:**
-- **Primary control**: Route-based pure-pursuit steering (no VLM dependency)
-- **VLM advisory**: CoT runs every 20 frames in a background thread; results modulate target speed and are displayed in the UI panel
-- **Safety layer**: `SafetyLimiter` overrides control for red lights, off-road correction, and stall recovery
+- **Primary steering**: The VLM CoT pipeline predicts 10 future `[speed, curvature]` actions. Curvatures are integrated with OpenEMMA's `IntegrateCurvatureForPoints` into an ego-local trajectory, and pure-pursuit follows that trajectory.
+- **Speed scaffolding**: Raw VLM speed predictions are unreliable, so they are sanitized, smoothed, clamped to a sane maximum, and governed by the controller's cruise floor and max cap rather than executed directly.
+- **Fallback and safety**: The route is retained for cold-start fallback plus stuck/off-road recovery. `SafetyLimiter` remains the backstop for red-light stops, lane-keeping/off-road correction, junction steering assist, and speed limits.
+- **VLM input**: This CARLA port feeds the local VLM one current front-camera frame per CoT cycle, matching OpenEMMA's local-model branch rather than a 10-frame image sequence.
 
 ---
 
@@ -182,8 +183,8 @@ cd /opt/carla
 ```bash
 conda activate openemma
 
-# LLaMA-3.2-11B-Vision (recommended)
-python openemmaUI.py --llama
+# LLaMA-3.2-11B-Vision (recommended; use --4bit for CARLA stability on ~32GB GPUs)
+python openemmaUI.py --llama --4bit
 
 # LLaVA-v1.5-7b
 python openemmaUI.py --llava
@@ -195,7 +196,7 @@ python openemmaUI.py --qwen
 OPENAI_API_KEY=sk-... python openemmaUI.py --gpt
 
 # Specify town
-python openemmaUI.py --llama --town Town02
+python openemmaUI.py --llama --4bit --town Town02
 
 # Custom model path
 python openemmaUI.py --model-path /path/to/custom/model
@@ -286,7 +287,7 @@ OpenEMMA-UI/
 <details>
 <summary><b>CUDA out of memory</b></summary>
 
-- LLaMA-3.2-11B requires ~22 GB VRAM. If your GPU has less, try:
+- LLaMA-3.2-11B should be run with `--4bit` when CARLA shares the GPU; on ~32 GB cards this leaves more headroom for the simulator. If your GPU has less, try:
   - `--llava` (14 GB) or `--qwen` (16 GB) instead
   - `--gpt` uses no local VRAM (cloud API)
 - Close other GPU-intensive applications before running
@@ -324,8 +325,10 @@ OpenEMMA-UI/
 
 ## Known Limitations
 
-- **VLM is advisory only**: The VLM Chain-of-Thought pipeline provides scene understanding displayed in the UI, but actual vehicle control relies on the route-based pure-pursuit controller. The VLM modulates target speed but does not directly steer.
-- **Hallucination in smaller models**: LLaVA-v1.5-7b and Qwen2-VL-7B frequently hallucinate "red traffic light" on empty roads, causing unnecessary stops. Use LLaMA-3.2-11B or GPT-4o for more reliable scene understanding.
+- **Steering is VLM-driven, speed is scaffolded**: The VLM's integrated curvature trajectory provides the primary steering signal, faithful to OpenEMMA, but raw VLM speed predictions are unreliable. Longitudinal speed is sanitized and governed by a min/max cruise envelope rather than executed directly.
+- **Hallucination in smaller models**: LLaVA-v1.5-7b and Qwen2-VL-7B persistently predict "stop" or "red traffic light" on empty roads in measured runs, causing unnecessary stops. Use LLaMA-3.2-11B or GPT-4o for more reliable scene understanding.
+- **Single-frame local VLM input**: The CARLA port sends one current frame to local models, not a 10-frame sequence, matching OpenEMMA's local-model branch.
+- **LLaMA VRAM/stability**: The 11B Llama backend needs `--4bit` to keep VRAM low enough for the CARLA server to stay stable alongside the model on a ~32 GB GPU.
 - **Single-town evaluation**: Current benchmarks are conducted on Town01. Results may vary on more complex maps (Town03, Town05) with different traffic patterns.
 - **No multi-agent traffic**: Testing is performed with CARLA's default traffic manager. Dense traffic scenarios have not been extensively evaluated.
 - **Windows-only testing**: While the codebase should work on Linux, it has only been tested on Windows 11.

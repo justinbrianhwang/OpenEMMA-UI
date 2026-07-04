@@ -146,18 +146,22 @@ class OpenEMMACarlaAgent:
     # Speed parameters
     CRUISE_SPEED = 4.5      # m/s (~16 km/h) - default target
     MAX_SPEED = 5.5         # m/s (~20 km/h) - max allowed
+    MIN_DRIVE_SPEED = 2.5   # m/s - standing-start floor
     TURN_SPEED = 2.5        # m/s (~9 km/h) - speed in sharp turns
     CURVE_SPEED = 3.8       # m/s (~14 km/h) - moderate curves
+    SANE_MAX_SPEED_MPS = 8.0
+    SANE_MAX_CURV = 0.3
     # Route steering (dual look-ahead)
     LOOK_AHEAD_NEAR = 12    # near target for lane centering
     LOOK_AHEAD_FAR = 22     # far target for turn anticipation
     LOOK_AHEAD_M = 4.0      # VLM trajectory look-ahead in ego-local meters
     STEER_GAIN = 1.3        # steering responsiveness
 
-    def __init__(self, model_path, device='cuda', use_4bit=False):
+    def __init__(self, model_path, device='cuda', use_4bit=False, debug=False):
         self.model_path = model_path
         self.use_4bit = use_4bit
         self.device = device
+        self.debug = debug
 
         # State
         self.step = 0
@@ -196,7 +200,11 @@ class OpenEMMACarlaAgent:
         # Stuck recovery
         self._stuck_counter = 0
         self._recovery_counter = 0
+        self._realign_counter = 0
         self._recovery_steer = 0.0
+        self._stuck_recovery_events = 0
+        self._last_recovery_route_idx = None
+        self._last_vlm_dbg_source = None
 
         # UI attributes (read by agent_runner._render_ui)
         self.curr_instruction = ''
@@ -219,6 +227,8 @@ class OpenEMMACarlaAgent:
         """Set the route for pure-pursuit steering."""
         self.route = world_route
         self._route_idx = 0
+        self._stuck_recovery_events = 0
+        self._last_recovery_route_idx = None
 
     def set_runner(self, runner):
         """Store runner reference for route regeneration."""
@@ -486,6 +496,55 @@ class OpenEMMACarlaAgent:
 
         return steer, True
 
+    def _road_recovery_steer(self, vehicle):
+        """Steer toward the nearest driving-lane center for recovery only."""
+        runner = getattr(self, '_runner', None)
+        world = getattr(runner, 'world', None)
+        if vehicle is None or world is None:
+            return 0.0
+
+        try:
+            carla_map = world.get_map()
+            veh_loc = vehicle.get_location()
+            wp = carla_map.get_waypoint(
+                veh_loc,
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving,
+            )
+        except Exception:
+            return 0.0
+
+        if wp is None:
+            return 0.0
+
+        veh_transform = vehicle.get_transform()
+        veh_fwd = veh_transform.get_forward_vector()
+        lane_loc = wp.transform.location
+        lane_fwd = wp.transform.get_forward_vector()
+
+        def _steer_to_vector(dx, dy):
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist < 1e-3:
+                return 0.0
+            dot = veh_fwd.x * dx + veh_fwd.y * dy
+            cross = veh_fwd.x * dy - veh_fwd.y * dx
+            return math.atan2(cross, dot) / (math.pi / 2.0)
+
+        center_dx = lane_loc.x - veh_loc.x
+        center_dy = lane_loc.y - veh_loc.y
+        center_dist = math.sqrt(center_dx * center_dx + center_dy * center_dy)
+        center_steer = _steer_to_vector(center_dx, center_dy)
+        align_steer = _steer_to_vector(lane_fwd.x, lane_fwd.y)
+
+        if center_dist > 2.0:
+            steer = 0.8 * center_steer + 0.2 * align_steer
+        elif center_dist > 0.5:
+            steer = 0.6 * center_steer + 0.4 * align_steer
+        else:
+            steer = 0.2 * center_steer + 0.8 * align_steer
+
+        return float(np.clip(steer * self.STEER_GAIN, -1.0, 1.0))
+
     def _compute_route_curvature(self):
         """Estimate upcoming route curvature for speed adaptation.
 
@@ -533,7 +592,9 @@ class OpenEMMACarlaAgent:
         heading = self.obs_initial_heading
 
         if len(positions) >= 2:
-            velocities = positions[1:] - positions[:-1]
+            velocities = np.zeros_like(positions)
+            velocities[1:] = positions[1:] - positions[:-1]
+            velocities[0] = velocities[1]
             vel_norm = np.linalg.norm(velocities, axis=1)
             curvatures = EstimateCurvatureFromTrajectory(positions)
             last_velocity = velocities[-1]
@@ -563,7 +624,7 @@ class OpenEMMACarlaAgent:
         fallback_speed = abs(float(current_speed)) * self.FRAME_DT
         return ", ".join(
             f"[{fallback_speed:.1f},{0.0:.1f}]"
-            for _ in range(self.OBS_LEN - 1)
+            for _ in range(self.OBS_LEN)
         )
 
     def _parse_motion_pairs(self, response):
@@ -691,6 +752,8 @@ class OpenEMMACarlaAgent:
 
         if self._recovery_counter > 0:
             self._recovery_counter -= 1
+            if vehicle is not None:
+                self._recovery_steer = -self._road_recovery_steer(vehicle)
             control.throttle = 0.5
             control.brake = 0.0
             control.reverse = True
@@ -698,26 +761,30 @@ class OpenEMMACarlaAgent:
             if self._recovery_counter == 0:
                 self._stuck_counter = 0
                 self.prev_steer = 0.0
+                self._realign_counter = 15
+            self.curr_instruction = "Road recovery reverse"
+            self.ui_desired_speed = self.TURN_SPEED
+            self.ui_curvature = 0.0
+            return control
+
+        if self._realign_counter > 0:
+            self._realign_counter -= 1
+            realign_steer = (
+                self._road_recovery_steer(vehicle)
+                if vehicle is not None else 0.0
+            )
+            control.reverse = False
+            control.steer = realign_steer
+            self.prev_steer = realign_steer
+            self._apply_speed_control(control, self.TURN_SPEED, current_speed)
+            self.curr_instruction = "Road recovery realign"
+            self.ui_desired_speed = self.TURN_SPEED
+            self.ui_curvature = 0.0
+            if self._realign_counter == 0:
+                self._stuck_counter = 0
             return control
 
         is_red = getattr(self, 'ui_red_light', False)
-        if abs(current_speed) < 0.3 and self.step > 20 and not is_red:
-            self._stuck_counter += 1
-        else:
-            self._stuck_counter = max(0, self._stuck_counter - 2)
-
-        if self._stuck_counter > 40:
-            old_idx = self._route_idx
-            self._route_idx = max(0, self._route_idx - 40)
-            print(f'[OpenEMMA] Stuck at step {self.step}, '
-                  f'route_idx {old_idx}->{self._route_idx}, reversing...')
-            self._recovery_steer = 0.3
-            if vehicle is not None:
-                rs, valid = self._get_route_steer(vehicle)
-                if valid:
-                    self._recovery_steer = -rs
-            self._recovery_counter = 25
-            self._stuck_counter = 0
 
         rgb_data = input_data.get('rgb_front', (0, None))[1]
         if rgb_data is not None and self.step % 20 == 0 and not self._cot_running:
@@ -778,6 +845,17 @@ class OpenEMMACarlaAgent:
             if vehicle is not None and self.route:
                 self._generate_route_waypoints(vehicle)
 
+        intent_lower = self.last_intent.lower()
+        scene_lower = self.last_scene.lower()
+        explicit_stop = (
+            'stop' in intent_lower
+            or 'red' in scene_lower
+            or 'red' in intent_lower
+        )
+        legitimate_stop = is_red or explicit_stop
+        if not legitimate_stop:
+            target_speed = max(target_speed, self.MIN_DRIVE_SPEED)
+
         steer_diff = abs(steer - self.prev_steer)
         if steer_diff > 0.15:
             alpha = 0.15
@@ -790,6 +868,54 @@ class OpenEMMACarlaAgent:
         control.steer = steer
 
         self._apply_speed_control(control, target_speed, current_speed)
+
+        if (
+            control.throttle > 0.1
+            and abs(current_speed) < 0.3
+            and self.step > 20
+            and not legitimate_stop
+        ):
+            self._stuck_counter += 1
+        else:
+            self._stuck_counter = max(0, self._stuck_counter - 2)
+
+        if self._stuck_counter > 40:
+            old_idx = self._route_idx
+            if (
+                self._last_recovery_route_idx is not None
+                and old_idx <= self._last_recovery_route_idx
+            ):
+                self._stuck_recovery_events += 1
+            else:
+                self._stuck_recovery_events = 1
+            self._last_recovery_route_idx = old_idx
+
+            if self._stuck_recovery_events >= 3:
+                print(f'[OpenEMMA] Stuck recovery loop at step {self.step}, '
+                      f'route_idx {old_idx}, regenerating route...')
+                self._regenerate_route()
+                self._stuck_recovery_events = 0
+                self._last_recovery_route_idx = None
+            else:
+                self._route_idx = max(0, self._route_idx - 40)
+                print(f'[OpenEMMA] Stuck at step {self.step}, '
+                      f'route_idx {old_idx}->{self._route_idx}, reversing...')
+
+            self._recovery_steer = (
+                -self._road_recovery_steer(vehicle)
+                if vehicle is not None else 0.0
+            )
+            self._recovery_counter = 25
+            self._realign_counter = 0
+            self._stuck_counter = 0
+
+        if self.step % 40 == 0 or control_source != self._last_vlm_dbg_source:
+            if self.debug:
+                print(
+                    f"[VLM-DBG] src={control_source} target_speed={target_speed:.1f} "
+                    f"steer={steer:+.2f} cur_speed={current_speed:.1f}"
+                )
+            self._last_vlm_dbg_source = control_source
 
         self.curr_instruction = (
             f"Intent: {self.last_intent[:80]}" if self.last_intent else control_source
@@ -895,8 +1021,48 @@ class OpenEMMACarlaAgent:
                 self.vlm_pred_curvatures = None
             return
 
-        pred_speeds = parsed[:, 0]
-        pred_curvatures = parsed[:, 1] / 100.0
+        raw_pred_speeds = parsed[:, 0]
+        raw_pred_speeds_mps = raw_pred_speeds / self.FRAME_DT
+        pred_speeds_mps = np.clip(
+            raw_pred_speeds_mps,
+            0.0,
+            self.SANE_MAX_SPEED_MPS,
+        )
+        if len(pred_speeds_mps) >= 3:
+            padded = np.pad(pred_speeds_mps, (1, 1), mode='edge')
+            pred_speeds_mps = np.convolve(
+                padded,
+                np.ones(3, dtype=float) / 3.0,
+                mode='valid',
+            )
+            pred_speeds_mps = np.clip(
+                pred_speeds_mps,
+                0.0,
+                self.SANE_MAX_SPEED_MPS,
+            )
+
+        pred_speeds = pred_speeds_mps * self.FRAME_DT
+        pred_curvatures = np.clip(
+            parsed[:, 1] / 100.0,
+            -self.SANE_MAX_CURV,
+            self.SANE_MAX_CURV,
+        )
+        raw_speed_preview = [round(float(v), 2) for v in raw_pred_speeds_mps[:3]]
+        sane_speed_preview = [round(float(v), 2) for v in pred_speeds_mps[:3]]
+
+        if len(pred_speeds_mps) == 0 or float(np.max(pred_speeds_mps)) < 0.1:
+            if self.debug:
+                print(
+                    f"[VLM-DBG] intent='{self.last_intent[:50]}' pairs={len(parsed)} "
+                    f"pred_speeds_mps={raw_speed_preview} "
+                    f"sane_speeds_mps={sane_speed_preview} rejected=degenerate"
+                )
+            with self._cot_lock:
+                self.vlm_traj = None
+                self.vlm_pred_speeds = None
+                self.vlm_pred_curvatures = None
+            return
+
         traj = IntegrateCurvatureForPoints(
             pred_curvatures,
             pred_speeds,
@@ -904,10 +1070,19 @@ class OpenEMMACarlaAgent:
             0.0,
             len(pred_speeds),
         )
+        traj_fwd_max = 0.0
+        if traj is not None and len(traj) > 0:
+            traj_fwd_max = round(float(np.max(np.asarray(traj)[:, 0])), 2)
+        if self.debug:
+            print(
+                f"[VLM-DBG] intent='{self.last_intent[:50]}' pairs={len(parsed)} "
+                f"pred_speeds_mps={raw_speed_preview} "
+                f"sane_speeds_mps={sane_speed_preview} traj_fwd_max={traj_fwd_max}"
+            )
 
         with self._cot_lock:
             self.vlm_traj = traj
-            self.vlm_pred_speeds = pred_speeds / self.FRAME_DT
+            self.vlm_pred_speeds = pred_speeds_mps
             self.vlm_pred_curvatures = pred_curvatures
 
     def _parse_motion(self, response):
@@ -958,6 +1133,8 @@ def main():
     # Performance options
     parser.add_argument('--4bit', dest='use_4bit', action='store_true',
                         help='Use 4-bit quantization (for 8GB VRAM GPUs)')
+    parser.add_argument('--debug', action='store_true',
+                        help='Print [VLM-DBG] diagnostic logs each frame/CoT cycle')
 
     args = parser.parse_args()
 
@@ -989,7 +1166,11 @@ def main():
         runner.setup()
 
         # 2. Create OpenEMMA agent
-        agent = OpenEMMACarlaAgent(model_path=model_path, use_4bit=args.use_4bit)
+        agent = OpenEMMACarlaAgent(
+            model_path=model_path,
+            use_4bit=args.use_4bit,
+            debug=args.debug,
+        )
 
         # 3. Generate route and pass to agent for steering
         _, world_route = runner.generate_route()
