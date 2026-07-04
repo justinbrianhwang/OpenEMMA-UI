@@ -1,5 +1,9 @@
 # OpenEMMA-UI
 
+<p align="center">
+  <img src="assets/figure/architecture.png" alt="OpenEMMA-UI Architecture" width="100%">
+</p>
+
 A real-time UI wrapper that adapts [OpenEMMA](https://github.com/taco-group/OpenEMMA) for live autonomous driving in [CARLA Simulator](https://carla.org/) (0.9.16).
 
 ![OpenEMMAGPTver-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/f2097d70-5660-4ff3-9d9f-6e40335f245f)
