@@ -981,9 +981,16 @@ class OpenEMMACarlaAgent:
             or 'red' in scene_lower
             or 'red' in intent_lower
         )
-        legitimate_stop = is_red or explicit_stop
+        predicted_stop = (
+            vlm_speeds is not None
+            and len(vlm_speeds) > 0
+            and float(np.max(vlm_speeds)) <= 0.05
+        )
+        legitimate_stop = is_red or explicit_stop or predicted_stop
         target_speed_before_floor = target_speed
-        if not legitimate_stop:
+        if legitimate_stop:
+            target_speed = 0.0
+        else:
             target_speed = max(target_speed, self.MIN_DRIVE_SPEED)
             if target_speed_before_floor < self.MIN_DRIVE_SPEED:
                 self.metrics['speed_floor_frames'] += 1
@@ -1202,7 +1209,7 @@ class OpenEMMACarlaAgent:
         raw_speed_preview = [round(float(v), 2) for v in raw_pred_speeds_mps[:3]]
         sane_speed_preview = [round(float(v), 2) for v in pred_speeds_mps[:3]]
 
-        if len(pred_speeds_mps) == 0 or float(np.max(pred_speeds_mps)) < 0.1:
+        if len(pred_speeds_mps) == 0:
             self.metrics['degenerate_rejections'] += 1
             if self.debug:
                 print(

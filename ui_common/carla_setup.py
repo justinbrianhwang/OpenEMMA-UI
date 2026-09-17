@@ -15,8 +15,12 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # CARLA may be installed in-repo or as a sibling of OpenEMMA-UI.
 _CARLA_IN_REPO = os.path.join(PROJECT_ROOT, 'CARLA_0.9.16')
 _CARLA_SIBLING = os.path.abspath(os.path.join(PROJECT_ROOT, '..', 'CARLA_0.9.16'))
+_CARLA_WORKSPACE = os.path.abspath(
+    os.path.join(PROJECT_ROOT, '..', '..', '..', 'CARLA_0.9.16')
+)
 CARLA_ROOT = next(
-    (path for path in (_CARLA_IN_REPO, _CARLA_SIBLING) if os.path.isdir(path)),
+    (path for path in (_CARLA_IN_REPO, _CARLA_SIBLING, _CARLA_WORKSPACE)
+     if os.path.isdir(path)),
     _CARLA_IN_REPO,
 )
 CARLA_PYTHONAPI = os.path.join(CARLA_ROOT, 'PythonAPI')

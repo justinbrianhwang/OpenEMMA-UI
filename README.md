@@ -53,6 +53,7 @@ openemmaUI.py                    # Main launcher & OpenEMMA agent
 **Control flow:**
 - **Primary steering**: The VLM CoT pipeline predicts 10 future `[speed, curvature]` actions. Curvatures are integrated with OpenEMMA's `IntegrateCurvatureForPoints` into an ego-local trajectory, and pure-pursuit follows that trajectory.
 - **Speed scaffolding**: Raw VLM speed predictions are unreliable, so they are sanitized, smoothed, clamped to a sane maximum, and governed by the controller's cruise floor and max cap rather than executed directly.
+- **Stops are never overridden**: An explicit stop intent, a red light, or an all-zero motion plan forces the target speed to zero — the cruise floor applies only to non-stop plans, so a predicted stop actually brakes the car.
 - **Fallback and safety**: The route is retained for cold-start fallback plus stuck/off-road recovery. `SafetyLimiter` remains the backstop for red-light stops, lane-keeping/off-road correction, junction steering assist, and speed limits.
 - **VLM input**: This CARLA port feeds the local VLM one current front-camera frame per CoT cycle, matching OpenEMMA's local-model branch rather than a 10-frame image sequence.
 
@@ -342,6 +343,18 @@ OpenEMMA-UI/
 </details>
 
 <details>
+<summary><b>ModuleNotFoundError: No module named 'agents'</b></summary>
+
+- The route planner needs CARLA's `PythonAPI/carla/agents` package on `sys.path`
+- `ui_common/carla_setup.py` auto-detects `CARLA_0.9.16` in-repo, as a sibling of `OpenEMMA-UI/`, or three directory levels up (workspace layouts)
+- If your CARLA lives elsewhere, add it manually before launch:
+  ```bash
+  set PYTHONPATH=%PYTHONPATH%;X:/path/to/CARLA_0.9.16/PythonAPI/carla
+  ```
+
+</details>
+
+<details>
 <summary><b>CUDA out of memory</b></summary>
 
 - LLaMA-3.2-11B should be run with `--4bit` when CARLA shares the GPU; on ~32 GB cards this leaves more headroom for the simulator. If your GPU has less, try:
@@ -383,7 +396,8 @@ OpenEMMA-UI/
 ## Known Limitations
 
 - **Steering is VLM-driven, speed is scaffolded**: The VLM's integrated curvature trajectory provides the primary steering signal, faithful to OpenEMMA, but raw VLM speed predictions are unreliable. Longitudinal speed is sanitized and governed by a min/max cruise envelope rather than executed directly.
-- **Hallucination in smaller models**: LLaVA-v1.5-7b and Qwen2-VL-7B persistently predict "stop" or "red traffic light" on empty roads in measured runs, causing unnecessary stops. Use LLaMA-3.2-11B or GPT-4o for more reliable scene understanding.
+- **Decision latency is seconds, not frames**: The four-stage CoT runs on a background thread, so rendering and control stay near 20 Hz, but a full scene→motion decision takes ~10–12 s per cycle with a local 7B VLM (measured mean 11.1 s with Qwen2-VL-7B fp16 on an RTX 5090; the critical-object and motion stages dominate). Semantic reactions therefore lag the world by about one CoT cycle, and the controller holds the last plan between cycles. The UI is real-time; the VLM decisions are not.
+- **Hallucination in smaller models**: LLaVA-v1.5-7b and Qwen2-VL-7B persistently predict "stop" or "red traffic light" on empty roads in measured runs, causing unnecessary stops. In a measured 210 s Town01 run, 17 of 18 Qwen motion outputs were all-zero plans (now honored as stops), so forward progress under Qwen relies largely on the route fallback. Use LLaMA-3.2-11B or GPT-4o for more reliable scene understanding.
 - **Single-frame local VLM input**: The CARLA port sends one current frame to local models, not a 10-frame sequence, matching OpenEMMA's local-model branch.
 - **LLaMA VRAM/stability**: The 11B Llama backend needs `--4bit` to keep VRAM low enough for the CARLA server to stay stable alongside the model on a ~32 GB GPU.
 - **Single-town evaluation (CARLA constraint)**: The closed-loop benchmark covers Town01 only. CARLA 0.9.16 on our setup reliably serves just one `load_world` per server process — the second map load corrupts the streaming subsystem and native-crashes the server — so cross-town sweeps (Town02/03/05) require a fresh server booted per town and are left as future work. The per-town rotation scaffolding already exists in `benchmark.py`/`run_sweep.py`.
